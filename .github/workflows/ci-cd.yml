@@ -1,13 +1,14 @@
-name: CI — Lint, Test & Build
+name: CI/CD — Lint, Test, Build & Deploy
 
 on:
   push:
-    branches: ["main", "develop"]
+    branches: ["master"]
   pull_request:
-    branches: ["main"]
+    branches: ["master"]
 
 env:
-  IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/fastapi-app
+  IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/fastapi-blog
+  K8S_NAMESPACE: fastapi-app
 
 jobs:
   # ──────────────────────────────────────────
@@ -17,13 +18,11 @@ jobs:
     name: Lint (ruff)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
           cache: "pip"
 
       - name: Install dev dependencies
@@ -40,13 +39,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
           cache: "pip"
 
       - name: Install dev dependencies
@@ -68,11 +65,11 @@ jobs:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
     needs: test
-    # Only push on pushes to main (not PRs)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -83,7 +80,7 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -101,3 +98,56 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ──────────────────────────────────────────
+  # Job 4: Deploy to Kubernetes
+  # ──────────────────────────────────────────
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag from commit SHA
+        id: vars
+        run: |
+          COMMIT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "full_image=${{ env.IMAGE_NAME }}:sha-${COMMIT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/secret.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/ingress.yaml
+          kubectl apply -f k8s/hpa.yaml
+
+      - name: Update Deployment image
+        run: |
+          kubectl set image deployment/fastapi-app \
+            fastapi-app=${{ steps.vars.outputs.full_image }} \
+            -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Wait for rollout to complete
+        run: |
+          kubectl rollout status deployment/fastapi-app \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=120s
+
+      - name: Verify pods are running
+        run: kubectl get pods -n ${{ env.K8S_NAMESPACE }}
